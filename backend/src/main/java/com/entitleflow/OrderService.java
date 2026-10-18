@@ -31,9 +31,9 @@ class OrderService {
             reserved.addAll(found);
         }
         transition(order,OrderStatus.VALIDATED,"Customer and requested products validated");
-        reserved.forEach(asset->{asset.status=AssetStatus.ALLOCATED;asset.customer=customer;assets.save(asset);});
+        reserved.forEach(asset->{asset.status=AssetStatus.ALLOCATED;asset.customer=customer;assets.save(asset);events.recordAsset(asset.assetTag,"ASSET_ALLOCATED","INFO","Asset allocated to order",Map.of("order",order.orderNumber,"customerId",customer.id));});
         transition(order,OrderStatus.ASSETS_RESERVED,"Reserved "+reserved.size()+" matching assets");
-        for(OrderItem item:order.items){Entitlement entitlement=new Entitlement();entitlement.entitlementKey="ENT-"+UUID.randomUUID().toString().substring(0,8).toUpperCase(Locale.ROOT);entitlement.customer=customer;entitlement.order=order;entitlement.product=item.product;entitlement.licenseType=item.licenseType;entitlement.quantity=item.quantity;entitlement.status=EntitlementStatus.PENDING;entitlements.save(entitlement);}
+        for(OrderItem item:order.items){Entitlement entitlement=new Entitlement();entitlement.entitlementKey="ENT-"+UUID.randomUUID().toString().substring(0,8).toUpperCase(Locale.ROOT);entitlement.customer=customer;entitlement.order=order;entitlement.product=item.product;entitlement.licenseType=item.licenseType;entitlement.quantity=item.quantity;entitlement.status=EntitlementStatus.PENDING;if("SUBSCRIPTION".equalsIgnoreCase(item.licenseType))entitlement.expiresAt=Instant.now().plusSeconds(31536000);entitlements.save(entitlement);}
         transition(order,OrderStatus.ENTITLEMENTS_CREATED,"Pending entitlements created");
         transition(order,OrderStatus.COMPLETED,"Order fulfilled"); order.updatedAt=Instant.now(); orders.save(order);
         events.record(order.orderNumber,"ORDER_COMPLETED","INFO","Order completed",Map.of("assetsAllocated",reserved.size(),"entitlementsCreated",order.items.size()));
@@ -44,12 +44,11 @@ class OrderService {
         if(order.status!=OrderStatus.FAILED) throw new ResponseStatusException(HttpStatus.CONFLICT,"Only failed orders can be retried");
         if(order.retryCount>=3) throw new ResponseStatusException(HttpStatus.CONFLICT,"Retry limit reached");
         order.retryCount++;order.failureReason=null;transition(order,OrderStatus.CREATED,"Retry attempt "+order.retryCount);orders.save(order);
-        OrderRequest request=new OrderRequest(order.customer.id,order.items.stream().map(i->new OrderItemRequest(i.product,i.quantity,i.licenseType)).toList());
         // Keep the original idempotency key and existing order: continue the same row without duplicating effects.
         List<Asset> reserved=new ArrayList<>();
         for(OrderItem item:order.items){List<Asset> found=assets.lockAvailable(item.product,AssetStatus.AVAILABLE,PageRequest.of(0,item.quantity));if(found.size()<item.quantity){order.status=OrderStatus.FAILED;order.failureReason="Insufficient available inventory for "+item.product;transition(order,OrderStatus.FAILED,order.failureReason);return order;}reserved.addAll(found);}
-        transition(order,OrderStatus.VALIDATED,"Retry validation passed");reserved.forEach(a->{a.status=AssetStatus.ALLOCATED;a.customer=order.customer;assets.save(a);});transition(order,OrderStatus.ASSETS_RESERVED,"Retry reserved "+reserved.size()+" assets");
-        if(entitlements.findByOrderId(order.id).isEmpty())for(OrderItem item:order.items){Entitlement e=new Entitlement();e.entitlementKey="ENT-"+UUID.randomUUID().toString().substring(0,8).toUpperCase(Locale.ROOT);e.customer=order.customer;e.order=order;e.product=item.product;e.licenseType=item.licenseType;e.quantity=item.quantity;e.status=EntitlementStatus.PENDING;entitlements.save(e);}
+        transition(order,OrderStatus.VALIDATED,"Retry validation passed");reserved.forEach(a->{a.status=AssetStatus.ALLOCATED;a.customer=order.customer;assets.save(a);events.recordAsset(a.assetTag,"ASSET_ALLOCATED","INFO","Asset allocated to order retry",Map.of("order",order.orderNumber));});transition(order,OrderStatus.ASSETS_RESERVED,"Retry reserved "+reserved.size()+" assets");
+        if(entitlements.findByOrderId(order.id).isEmpty())for(OrderItem item:order.items){Entitlement e=new Entitlement();e.entitlementKey="ENT-"+UUID.randomUUID().toString().substring(0,8).toUpperCase(Locale.ROOT);e.customer=order.customer;e.order=order;e.product=item.product;e.licenseType=item.licenseType;e.quantity=item.quantity;e.status=EntitlementStatus.PENDING;if("SUBSCRIPTION".equalsIgnoreCase(item.licenseType))e.expiresAt=Instant.now().plusSeconds(31536000);entitlements.save(e);}
         transition(order,OrderStatus.ENTITLEMENTS_CREATED,"Retry entitlements ready");transition(order,OrderStatus.COMPLETED,"Retry completed");order.updatedAt=Instant.now();events.record(order.orderNumber,"ORDER_RETRIED","INFO","Order retry completed",Map.of("attempt",order.retryCount));return order;
     }
     private boolean samePayload(OrderRecord order,OrderRequest request){return Objects.equals(order.customer.id,request.customerId())&&order.items.size()==request.items().size()&&order.items.stream().allMatch(i->request.items().stream().anyMatch(r->i.product.equals(r.product().trim())&&i.quantity==r.quantity()&&i.licenseType.equals(r.licenseType().trim())));}
